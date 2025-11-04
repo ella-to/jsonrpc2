@@ -12,8 +12,8 @@ import (
 	"sync/atomic"
 )
 
-// Client implements a JSON-RPC 2.0 client over an io.ReadWriteCloser transport.
-type Client struct {
+// RawClient implements a JSON-RPC 2.0 client over an io.ReadWriteCloser transport.
+type RawClient struct {
 	conn     io.ReadWriteCloser
 	encoder  *json.Encoder
 	decoder  *json.Decoder
@@ -38,11 +38,11 @@ type BatchCall struct {
 	Notify bool
 }
 
-// NewClient constructs a Client that communicates over rwc.
-func NewClient(rwc io.ReadWriteCloser) *Client {
+// NewRawClient constructs a Client that communicates over rwc.
+func NewRawClient(rwc io.ReadWriteCloser) *RawClient {
 	dec := json.NewDecoder(rwc)
 	dec.UseNumber()
-	c := &Client{
+	c := &RawClient{
 		conn:    rwc,
 		encoder: json.NewEncoder(rwc),
 		decoder: dec,
@@ -54,7 +54,7 @@ func NewClient(rwc io.ReadWriteCloser) *Client {
 }
 
 // Call issues a JSON-RPC request and waits for the corresponding response.
-func (c *Client) Call(ctx context.Context, method string, params any) (*Response, error) {
+func (c *RawClient) Call(ctx context.Context, method string, params any) (*Response, error) {
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
@@ -104,7 +104,7 @@ func (c *Client) Call(ctx context.Context, method string, params any) (*Response
 }
 
 // Notify sends a JSON-RPC notification (request without an ID).
-func (c *Client) Notify(ctx context.Context, method string, params any) error {
+func (c *RawClient) Notify(ctx context.Context, method string, params any) error {
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
@@ -131,7 +131,7 @@ func (c *Client) Notify(ctx context.Context, method string, params any) error {
 
 // Batch sends a JSON-RPC batch composed of the provided calls. Responses are returned
 // in the same order as the supplied calls, with nil entries for notifications.
-func (c *Client) Batch(ctx context.Context, calls []BatchCall) ([]*Response, error) {
+func (c *RawClient) Batch(ctx context.Context, calls []BatchCall) ([]*Response, error) {
 	if len(calls) == 0 {
 		return nil, nil
 	}
@@ -212,7 +212,7 @@ func (c *Client) Batch(ctx context.Context, calls []BatchCall) ([]*Response, err
 }
 
 // Close terminates the underlying transport and releases resources.
-func (c *Client) Close() error {
+func (c *RawClient) Close() error {
 	c.closeMu.Lock()
 	if c.closeErr != nil {
 		err := c.closeErr
@@ -236,13 +236,13 @@ func (c *Client) Close() error {
 }
 
 // CloseError reports the error that caused the client to close, if any.
-func (c *Client) CloseError() error {
+func (c *RawClient) CloseError() error {
 	c.closeMu.Lock()
 	defer c.closeMu.Unlock()
 	return c.closeErr
 }
 
-func (c *Client) readLoop() {
+func (c *RawClient) readLoop() {
 	for {
 		var raw json.RawMessage
 		if err := c.decoder.Decode(&raw); err != nil {
@@ -280,13 +280,13 @@ func (c *Client) readLoop() {
 	}
 }
 
-func (c *Client) send(msg any) error {
+func (c *RawClient) send(msg any) error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
 	return c.encoder.Encode(msg)
 }
 
-func (c *Client) dispatchResponse(resp *Response) {
+func (c *RawClient) dispatchResponse(resp *Response) {
 	if resp.JSONRPC != Version {
 		c.failPending(&Error{Code: InvalidRequest, Message: "invalid JSON-RPC version"})
 		return
@@ -310,7 +310,7 @@ func (c *Client) dispatchResponse(resp *Response) {
 	}
 }
 
-func (c *Client) removePending(id string) chan callResult {
+func (c *RawClient) removePending(id string) chan callResult {
 	c.pendMu.Lock()
 	defer c.pendMu.Unlock()
 	ch, ok := c.pending[id]
@@ -320,7 +320,7 @@ func (c *Client) removePending(id string) chan callResult {
 	return ch
 }
 
-func (c *Client) failPending(err error) {
+func (c *RawClient) failPending(err error) {
 	if err == nil {
 		err = io.EOF
 	}

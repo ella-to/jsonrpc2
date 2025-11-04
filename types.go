@@ -1,6 +1,7 @@
 package jsonrpc2
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 )
@@ -43,4 +44,42 @@ type Error struct {
 // Error implements the error interface for JSON-RPC error objects.
 func (e *Error) Error() string {
 	return fmt.Sprintf("JSON-RPC error %d: %s", e.Code, e.Message)
+}
+
+// Handler serves JSON-RPC requests.
+type Handler interface {
+	Handle(ctx context.Context, req *Request) (*Response, error)
+}
+
+// HandlerFunc adapts a function to the Handler interface.
+type HandlerFunc func(ctx context.Context, req *Request) (*Response, error)
+
+// Handle dispatches the request to f.
+func (f HandlerFunc) Handle(ctx context.Context, req *Request) (*Response, error) {
+	return f(ctx, req)
+}
+
+func WithRequest(method string, params any, isNotify bool) *Request {
+	req := &Request{
+		JSONRPC: Version,
+		Method:  method,
+	}
+
+	if params != nil {
+		raw, err := json.Marshal(params)
+		if err != nil {
+			panic(err)
+		}
+		req.Params = raw
+	}
+
+	if !isNotify {
+		req.ID = "1" // Dummy ID for non-notification requests
+	}
+
+	return req
+}
+
+type Caller interface {
+	Call(ctx context.Context, requests ...*Request) ([]*Response, error)
 }

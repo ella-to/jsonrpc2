@@ -9,21 +9,8 @@ import (
 	"sync"
 )
 
-// Handler serves JSON-RPC requests.
-type Handler interface {
-	Handle(ctx context.Context, req *Request) (*Response, error)
-}
-
-// HandlerFunc adapts a function to the Handler interface.
-type HandlerFunc func(ctx context.Context, req *Request) (*Response, error)
-
-// Handle dispatches the request to f.
-func (f HandlerFunc) Handle(ctx context.Context, req *Request) (*Response, error) {
-	return f(ctx, req)
-}
-
 // Server processes JSON-RPC requests over an io.ReadWriteCloser transport.
-type Server struct {
+type RawServer struct {
 	conn     io.ReadWriteCloser
 	encoder  *json.Encoder
 	decoder  *json.Decoder
@@ -34,14 +21,14 @@ type Server struct {
 	closeMu  sync.Mutex
 }
 
-// NewServer constructs a Server that uses handler to process incoming requests.
-func NewServer(rwc io.ReadWriteCloser, handler Handler) *Server {
+// NewRawServer constructs a Server that uses handler to process incoming requests.
+func NewRawServer(rwc io.ReadWriteCloser, handler Handler) *RawServer {
 	if handler == nil {
 		panic("jsonrpc: handler cannot be nil")
 	}
 	dec := json.NewDecoder(rwc)
 	dec.UseNumber()
-	return &Server{
+	return &RawServer{
 		conn:    rwc,
 		encoder: json.NewEncoder(rwc),
 		decoder: dec,
@@ -54,7 +41,7 @@ func NewServer(rwc io.ReadWriteCloser, handler Handler) *Server {
 // connection terminates. It launches a goroutine per request so handler calls
 // can run concurrently. The returned error is nil when the peer closes the
 // connection cleanly.
-func (s *Server) Serve(ctx context.Context) error {
+func (s *RawServer) Serve(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
@@ -99,7 +86,7 @@ func (s *Server) Serve(ctx context.Context) error {
 }
 
 // Close shuts down the server and closes the underlying transport.
-func (s *Server) Close() error {
+func (s *RawServer) Close() error {
 	s.closeMu.Lock()
 	if s.closeErr != nil {
 		err := s.closeErr
@@ -118,13 +105,13 @@ func (s *Server) Close() error {
 }
 
 // CloseError reports the error that closed the server, if any.
-func (s *Server) CloseError() error {
+func (s *RawServer) CloseError() error {
 	s.closeMu.Lock()
 	defer s.closeMu.Unlock()
 	return s.closeErr
 }
 
-func (s *Server) handleRequest(ctx context.Context, req *Request) *Response {
+func (s *RawServer) handleRequest(ctx context.Context, req *Request) *Response {
 	if req.Method == "" {
 		return s.errorResponse(req.ID, InvalidRequest, "method is required", nil)
 	}
@@ -155,7 +142,7 @@ func (s *Server) handleRequest(ctx context.Context, req *Request) *Response {
 	return resp
 }
 
-func (s *Server) handleBatch(ctx context.Context, raw json.RawMessage) {
+func (s *RawServer) handleBatch(ctx context.Context, raw json.RawMessage) {
 	var entries []json.RawMessage
 	if err := json.Unmarshal(raw, &entries); err != nil {
 		s.sendResponse(s.errorResponseWithNull(InvalidRequest, "invalid request", err.Error()))
@@ -208,7 +195,7 @@ func (s *Server) handleBatch(ctx context.Context, raw json.RawMessage) {
 	s.sendBatch(ordered)
 }
 
-func (s *Server) sendResponse(resp *Response) {
+func (s *RawServer) sendResponse(resp *Response) {
 	if resp == nil {
 		return
 	}
@@ -219,7 +206,7 @@ func (s *Server) sendResponse(resp *Response) {
 	}
 }
 
-func (s *Server) sendBatch(resps []*Response) {
+func (s *RawServer) sendBatch(resps []*Response) {
 	if len(resps) == 0 {
 		return
 	}
@@ -230,7 +217,7 @@ func (s *Server) sendBatch(resps []*Response) {
 	}
 }
 
-func (s *Server) errorResponse(id any, code int, message string, data any) *Response {
+func (s *RawServer) errorResponse(id any, code int, message string, data any) *Response {
 	if id == nil {
 		return nil
 	}
@@ -245,7 +232,7 @@ func (s *Server) errorResponse(id any, code int, message string, data any) *Resp
 	}
 }
 
-func (s *Server) errorResponseWithNull(code int, message string, data any) *Response {
+func (s *RawServer) errorResponseWithNull(code int, message string, data any) *Response {
 	return &Response{
 		JSONRPC: Version,
 		Error: &Error{
@@ -257,7 +244,7 @@ func (s *Server) errorResponseWithNull(code int, message string, data any) *Resp
 	}
 }
 
-func (s *Server) fail(err error) {
+func (s *RawServer) fail(err error) {
 	if err == nil {
 		err = io.EOF
 	}
@@ -270,7 +257,7 @@ func (s *Server) fail(err error) {
 	s.closeMu.Unlock()
 }
 
-func (s *Server) closeOnce() {
+func (s *RawServer) closeOnce() {
 	select {
 	case <-s.closed:
 	default:

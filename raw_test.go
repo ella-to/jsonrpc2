@@ -13,14 +13,14 @@ import (
 )
 
 type serverHarness struct {
-	client *jsonrpc2.Client
+	client *jsonrpc2.RawClient
 	done   chan error
 	cancel context.CancelFunc
 }
 
 type rawServerHarness struct {
 	conn   net.Conn
-	server *jsonrpc2.Server
+	server *jsonrpc2.RawServer
 	done   chan error
 	cancel context.CancelFunc
 }
@@ -30,8 +30,8 @@ func newServerHarness(t *testing.T, handler jsonrpc2.Handler) *serverHarness {
 
 	serverConn, clientConn := net.Pipe()
 
-	server := jsonrpc2.NewServer(serverConn, handler)
-	client := jsonrpc2.NewClient(clientConn)
+	server := jsonrpc2.NewRawServer(serverConn, handler)
+	client := jsonrpc2.NewRawClient(clientConn)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
@@ -64,7 +64,7 @@ func newRawServerHarness(t *testing.T, handler jsonrpc2.Handler) *rawServerHarne
 
 	serverConn, clientConn := net.Pipe()
 
-	server := jsonrpc2.NewServer(serverConn, handler)
+	server := jsonrpc2.NewRawServer(serverConn, handler)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 
