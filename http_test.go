@@ -22,10 +22,14 @@ func TestHTTPClientCall(t *testing.T) {
 
 	client := jsonrpc2.NewHTTPClient(server.URL, server.Client())
 
-	resp, err := client.Call(context.Background(), "echo", map[string]string{"message": "ping"})
+	responses, err := client.Call(context.Background(), jsonrpc2.WithRequest("echo", map[string]string{"message": "ping"}, false))
 	if err != nil {
 		t.Fatalf("Call returned error: %v", err)
 	}
+	if len(responses) != 1 {
+		t.Fatalf("expected single response, got %d", len(responses))
+	}
+	resp := responses[0]
 	if resp == nil {
 		t.Fatalf("Call returned nil response")
 	}
@@ -74,8 +78,15 @@ func TestHTTPClientNotify(t *testing.T) {
 
 	client := jsonrpc2.NewHTTPClient(server.URL, server.Client())
 
-	if err := client.Notify(context.Background(), "event", map[string]int{"value": 42}); err != nil {
-		t.Fatalf("Notify returned error: %v", err)
+	responses, err := client.Call(context.Background(), jsonrpc2.WithRequest("event", map[string]int{"value": 42}, true))
+	if err != nil {
+		t.Fatalf("Call returned error: %v", err)
+	}
+	if len(responses) != 1 {
+		t.Fatalf("expected single response entry, got %d", len(responses))
+	}
+	if responses[0] != nil {
+		t.Fatalf("expected nil response for notification, got %+v", responses[0])
 	}
 
 	received := recv(t, notifyCh)
@@ -115,19 +126,19 @@ func TestHTTPClientBatch(t *testing.T) {
 
 	client := jsonrpc2.NewHTTPClient(server.URL, server.Client())
 
-	calls := []jsonrpc2.BatchCall{
-		{Method: "first", Params: map[string]int{"value": 1}},
-		{Method: "notify", Params: map[string]int{"value": 2}, Notify: true},
-		{Method: "failure"},
-		{Method: "second", Params: map[string]int{"value": 3}},
+	requests := []*jsonrpc2.Request{
+		jsonrpc2.WithRequest("first", map[string]int{"value": 1}, false),
+		jsonrpc2.WithRequest("notify", map[string]int{"value": 2}, true),
+		jsonrpc2.WithRequest("failure", nil, false),
+		jsonrpc2.WithRequest("second", map[string]int{"value": 3}, false),
 	}
 
-	responses, err := client.Batch(context.Background(), calls)
+	responses, err := client.Call(context.Background(), requests...)
 	if err != nil {
-		t.Fatalf("Batch returned error: %v", err)
+		t.Fatalf("Call returned error: %v", err)
 	}
-	if len(responses) != len(calls) {
-		t.Fatalf("expected %d responses, got %d", len(calls), len(responses))
+	if len(responses) != len(requests) {
+		t.Fatalf("expected %d responses, got %d", len(requests), len(responses))
 	}
 
 	if responses[0] == nil || responses[0].Error != nil {
@@ -172,7 +183,7 @@ func TestHTTPClientBatch(t *testing.T) {
 		"notify":  {},
 		"failure": {},
 	}
-	for range len(calls) {
+	for i := 0; i < len(requests); i++ {
 		req := recv(t, reqCh)
 		delete(methods, req.Method)
 		if req.Method == "notify" && req.ID != nil {

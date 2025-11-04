@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+
+	"github.com/rs/xid"
 )
 
 // Version represents the JSON-RPC protocol version supported by this package.
@@ -74,12 +76,13 @@ func WithRequest(method string, params any, isNotify bool) *Request {
 	}
 
 	if !isNotify {
-		req.ID = "1" // Dummy ID for non-notification requests
+		req.ID = xid.New().String()
 	}
 
 	return req
 }
 
+// Caller issues JSON-RPC requests and returns their responses.
 type Caller interface {
 	Call(ctx context.Context, requests ...*Request) ([]*Response, error)
 }

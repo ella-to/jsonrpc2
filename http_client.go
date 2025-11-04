@@ -7,16 +7,15 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"strconv"
-	"sync/atomic"
 )
 
 // HTTPClient issues JSON-RPC requests over HTTP.
 type HTTPClient struct {
 	endpoint string
 	client   *http.Client
-	nextID   uint64
 }
+
+var _ Caller = (*HTTPClient)(nil)
 
 // NewHTTPClient constructs an HTTP JSON-RPC client targeting endpoint. If client is nil,
 // http.DefaultClient is used.
@@ -33,146 +32,57 @@ func NewHTTPClient(endpoint string, client *http.Client) *HTTPClient {
 	}
 }
 
-// Call sends a JSON-RPC request with a generated identifier and returns the server response.
-func (c *HTTPClient) Call(ctx context.Context, method string, params any) (*Response, error) {
+// Call sends the provided requests to the JSON-RPC endpoint. The payload is always
+// encoded as a JSON array, even when only a single request is supplied. Responses are
+// aligned with the order of the supplied requests, and notifications (requests without
+// an id) yield nil entries in the returned slice.
+func (c *HTTPClient) Call(ctx context.Context, requests ...*Request) ([]*Response, error) {
 	if c == nil {
 		return nil, fmt.Errorf("jsonrpc2: HTTPClient is nil")
 	}
-
-	id := atomic.AddUint64(&c.nextID, 1)
-	idStr := strconv.FormatUint(id, 10)
-
-	req := &Request{
-		JSONRPC: Version,
-		Method:  method,
-		ID:      idStr,
-	}
-
-	if params != nil {
-		raw, err := json.Marshal(params)
-		if err != nil {
-			return nil, err
-		}
-		req.Params = raw
-	}
-
-	body, status, err := c.send(ctx, req)
-	if err != nil {
-		return nil, err
-	}
-	if status < http.StatusOK || status >= http.StatusMultipleChoices {
-		return nil, fmt.Errorf("jsonrpc2: unexpected HTTP status %d", status)
-	}
-
-	trimmed := bytes.TrimSpace(body)
-	if len(trimmed) == 0 {
-		return nil, fmt.Errorf("jsonrpc2: empty response body")
-	}
-
-	var resp Response
-	if err := json.Unmarshal(trimmed, &resp); err != nil {
-		return nil, err
-	}
-	if resp.JSONRPC != Version {
-		return nil, fmt.Errorf("jsonrpc2: invalid JSON-RPC version %q", resp.JSONRPC)
-	}
-
-	return &resp, nil
-}
-
-// Notify sends a JSON-RPC notification without waiting for a server response.
-func (c *HTTPClient) Notify(ctx context.Context, method string, params any) error {
-	if c == nil {
-		return fmt.Errorf("jsonrpc2: HTTPClient is nil")
-	}
-
-	req := &Request{
-		JSONRPC: Version,
-		Method:  method,
-	}
-
-	if params != nil {
-		raw, err := json.Marshal(params)
-		if err != nil {
-			return err
-		}
-		req.Params = raw
-	}
-
-	body, status, err := c.send(ctx, req)
-	if err != nil {
-		return err
-	}
-	if status < http.StatusOK || status >= http.StatusMultipleChoices {
-		return fmt.Errorf("jsonrpc2: unexpected HTTP status %d", status)
-	}
-
-	trimmed := bytes.TrimSpace(body)
-	if len(trimmed) == 0 {
-		return nil
-	}
-
-	var resp Response
-	if err := json.Unmarshal(trimmed, &resp); err != nil {
-		return fmt.Errorf("jsonrpc2: cannot decode notification response: %w", err)
-	}
-	if resp.Error != nil {
-		return resp.Error
-	}
-
-	return nil
-}
-
-// Batch issues a JSON-RPC batch request and returns the responses in the same order as calls.
-// Notifications yield nil entries in the returned slice.
-func (c *HTTPClient) Batch(ctx context.Context, calls []BatchCall) ([]*Response, error) {
-	if c == nil {
-		return nil, fmt.Errorf("jsonrpc2: HTTPClient is nil")
-	}
-	if len(calls) == 0 {
+	if len(requests) == 0 {
 		return nil, nil
 	}
 
-	requests := make([]Request, 0, len(calls))
-	responses := make([]*Response, len(calls))
-	idToIndex := make(map[string]int, len(calls))
+	responses := make([]*Response, len(requests))
+	idToIndex := make(map[string]int, len(requests))
+	expected := 0
 
-	for i, call := range calls {
-		req := Request{
-			JSONRPC: Version,
-			Method:  call.Method,
+	for i, req := range requests {
+		if req == nil {
+			return nil, fmt.Errorf("jsonrpc2: request at index %d is nil", i)
 		}
-		if call.Params != nil {
-			raw, err := json.Marshal(call.Params)
-			if err != nil {
-				return nil, err
-			}
-			req.Params = raw
+		if req.JSONRPC == "" {
+			req.JSONRPC = Version
 		}
-		if !call.Notify {
-			id := atomic.AddUint64(&c.nextID, 1)
-			idStr := strconv.FormatUint(id, 10)
-			req.ID = idStr
-			idToIndex[idStr] = i
+		if req.ID == nil {
+			continue
 		}
-		requests = append(requests, req)
+		idKey, ok := normalizeID(req.ID)
+		if !ok {
+			return nil, fmt.Errorf("jsonrpc2: invalid request id at index %d", i)
+		}
+		if _, exists := idToIndex[idKey]; exists {
+			return nil, fmt.Errorf("jsonrpc2: duplicate request id %s", idKey)
+		}
+		idToIndex[idKey] = i
+		expected++
 	}
 
 	body, status, err := c.send(ctx, requests)
 	if err != nil {
 		return nil, err
 	}
-	if len(idToIndex) == 0 {
-		// All notifications; servers may legitimately return no content.
-		return responses, nil
-	}
 	if status < http.StatusOK || status >= http.StatusMultipleChoices {
 		return nil, fmt.Errorf("jsonrpc2: unexpected HTTP status %d", status)
+	}
+	if expected == 0 {
+		return responses, nil
 	}
 
 	trimmed := bytes.TrimSpace(body)
 	if len(trimmed) == 0 {
-		return nil, fmt.Errorf("jsonrpc2: empty batch response body")
+		return nil, fmt.Errorf("jsonrpc2: empty response body")
 	}
 
 	switch trimmed[0] {
@@ -198,7 +108,6 @@ func (c *HTTPClient) Batch(ctx context.Context, calls []BatchCall) ([]*Response,
 			responses[idx] = &respCopy
 		}
 	case '{':
-		// Some servers may return a single response object when only one call was present.
 		var resp Response
 		if err := json.Unmarshal(trimmed, &resp); err != nil {
 			return nil, err
@@ -214,22 +123,23 @@ func (c *HTTPClient) Batch(ctx context.Context, calls []BatchCall) ([]*Response,
 		if !ok {
 			return nil, fmt.Errorf("jsonrpc2: unexpected response id %s", idKey)
 		}
-		responses[idx] = &resp
+		respCopy := resp
+		responses[idx] = &respCopy
 	default:
-		return nil, fmt.Errorf("jsonrpc2: invalid batch response payload")
+		return nil, fmt.Errorf("jsonrpc2: invalid response payload")
 	}
 
 	for _, idx := range idToIndex {
 		if responses[idx] == nil {
-			return nil, fmt.Errorf("jsonrpc2: missing response for call index %d", idx)
+			return nil, fmt.Errorf("jsonrpc2: missing response for request index %d", idx)
 		}
 	}
 
 	return responses, nil
 }
 
-func (c *HTTPClient) send(ctx context.Context, payload any) ([]byte, int, error) {
-	data, err := json.Marshal(payload)
+func (c *HTTPClient) send(ctx context.Context, requests []*Request) ([]byte, int, error) {
+	data, err := json.Marshal(requests)
 	if err != nil {
 		return nil, 0, err
 	}

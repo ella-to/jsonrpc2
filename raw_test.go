@@ -99,10 +99,14 @@ func TestClientCallSuccess(t *testing.T) {
 		return &jsonrpc2.Response{Result: mustRaw(t, map[string]string{"message": "pong"})}, nil
 	}))
 
-	resp, err := h.client.Call(context.Background(), "echo", map[string]string{"message": "ping"})
+	responses, err := h.client.Call(context.Background(), jsonrpc2.WithRequest("echo", map[string]string{"message": "ping"}, false))
 	if err != nil {
 		t.Fatalf("Call returned error: %v", err)
 	}
+	if len(responses) != 1 {
+		t.Fatalf("expected single response, got %d", len(responses))
+	}
+	resp := responses[0]
 	if resp == nil {
 		t.Fatalf("Call returned nil response")
 	}
@@ -146,8 +150,15 @@ func TestClientNotify(t *testing.T) {
 		return nil, nil
 	}))
 
-	if err := h.client.Notify(context.Background(), "event", map[string]int{"value": 42}); err != nil {
-		t.Fatalf("Notify returned error: %v", err)
+	responses, err := h.client.Call(context.Background(), jsonrpc2.WithRequest("event", map[string]int{"value": 42}, true))
+	if err != nil {
+		t.Fatalf("Call returned error: %v", err)
+	}
+	if len(responses) != 1 {
+		t.Fatalf("expected single response entry, got %d", len(responses))
+	}
+	if responses[0] != nil {
+		t.Fatalf("expected nil response for notification, got %+v", responses[0])
 	}
 
 	received := recv(t, notifyCh)
@@ -178,18 +189,18 @@ func TestClientBatch(t *testing.T) {
 		return &jsonrpc2.Response{Result: mustRaw(t, map[string]any{"method": req.Method})}, nil
 	}))
 
-	calls := []jsonrpc2.BatchCall{
-		{Method: "first", Params: map[string]int{"value": 1}},
-		{Method: "notify", Params: map[string]int{"value": 2}, Notify: true},
-		{Method: "error"},
+	requests := []*jsonrpc2.Request{
+		jsonrpc2.WithRequest("first", map[string]int{"value": 1}, false),
+		jsonrpc2.WithRequest("notify", map[string]int{"value": 2}, true),
+		jsonrpc2.WithRequest("error", nil, false),
 	}
 
-	responses, err := h.client.Batch(context.Background(), calls)
+	responses, err := h.client.Call(context.Background(), requests...)
 	if err != nil {
-		t.Fatalf("Batch returned error: %v", err)
+		t.Fatalf("Call returned error: %v", err)
 	}
-	if len(responses) != len(calls) {
-		t.Fatalf("expected %d responses, got %d", len(calls), len(responses))
+	if len(responses) != len(requests) {
+		t.Fatalf("expected %d responses, got %d", len(requests), len(responses))
 	}
 
 	if responses[0] == nil {
@@ -224,7 +235,7 @@ func TestClientBatch(t *testing.T) {
 	}
 
 	received := map[string]struct{}{}
-	for i := 0; i < 3; i++ {
+	for i := 0; i < len(requests); i++ {
 		req := recv(t, reqCh)
 		received[req.Method] = struct{}{}
 		if req.Method == "notify" {
@@ -254,9 +265,16 @@ func TestClientCallErrors(t *testing.T) {
 		}
 	}))
 
-	resp, err := h.client.Call(context.Background(), "missing", nil)
+	responses, err := h.client.Call(context.Background(), jsonrpc2.WithRequest("missing", nil, false))
 	if err != nil {
 		t.Fatalf("Call returned transport error: %v", err)
+	}
+	if len(responses) != 1 {
+		t.Fatalf("expected single response, got %d", len(responses))
+	}
+	resp := responses[0]
+	if resp == nil {
+		t.Fatalf("expected error response, got nil")
 	}
 	if resp.Error == nil {
 		t.Fatalf("expected JSON-RPC error response")
@@ -268,9 +286,16 @@ func TestClientCallErrors(t *testing.T) {
 		t.Fatalf("unexpected error message: %s", resp.Error.Message)
 	}
 
-	resp, err = h.client.Call(context.Background(), "explode", nil)
+	responses, err = h.client.Call(context.Background(), jsonrpc2.WithRequest("explode", nil, false))
 	if err != nil {
 		t.Fatalf("Call returned transport error: %v", err)
+	}
+	if len(responses) != 1 {
+		t.Fatalf("expected single response, got %d", len(responses))
+	}
+	resp = responses[0]
+	if resp == nil {
+		t.Fatalf("expected error response, got nil")
 	}
 	if resp.Error == nil {
 		t.Fatalf("expected JSON-RPC error response")

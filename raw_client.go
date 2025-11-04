@@ -5,11 +5,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"math"
 	"strconv"
 	"sync"
-	"sync/atomic"
 )
 
 // RawClient implements a JSON-RPC 2.0 client over an io.ReadWriteCloser transport.
@@ -20,22 +20,16 @@ type RawClient struct {
 	pending  map[string]chan callResult
 	pendMu   sync.Mutex
 	writeMu  sync.Mutex
-	nextID   uint64
 	closed   chan struct{}
 	closeErr error
 	closeMu  sync.Mutex
 }
 
+var _ Caller = (*RawClient)(nil)
+
 type callResult struct {
 	resp *Response
 	err  error
-}
-
-// BatchCall represents a single request within a JSON-RPC batch.
-type BatchCall struct {
-	Method string
-	Params any
-	Notify bool
 }
 
 // NewRawClient constructs a Client that communicates over rwc.
@@ -53,86 +47,12 @@ func NewRawClient(rwc io.ReadWriteCloser) *RawClient {
 	return c
 }
 
-// Call issues a JSON-RPC request and waits for the corresponding response.
-func (c *RawClient) Call(ctx context.Context, method string, params any) (*Response, error) {
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case <-c.closed:
-		return nil, c.CloseError()
-	default:
-	}
-
-	id := atomic.AddUint64(&c.nextID, 1)
-	idStr := strconv.FormatUint(id, 10)
-
-	req := &Request{
-		JSONRPC: Version,
-		Method:  method,
-		ID:      idStr,
-	}
-
-	if params != nil {
-		raw, err := json.Marshal(params)
-		if err != nil {
-			return nil, err
-		}
-		req.Params = raw
-	}
-
-	respCh := make(chan callResult, 1)
-
-	c.pendMu.Lock()
-	c.pending[idStr] = respCh
-	c.pendMu.Unlock()
-
-	if err := c.send(req); err != nil {
-		c.removePending(idStr)
-		return nil, err
-	}
-
-	select {
-	case <-ctx.Done():
-		c.removePending(idStr)
-		return nil, ctx.Err()
-	case <-c.closed:
-		c.removePending(idStr)
-		return nil, c.CloseError()
-	case res := <-respCh:
-		return res.resp, res.err
-	}
-}
-
-// Notify sends a JSON-RPC notification (request without an ID).
-func (c *RawClient) Notify(ctx context.Context, method string, params any) error {
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-c.closed:
-		return c.CloseError()
-	default:
-	}
-
-	req := &Request{
-		JSONRPC: Version,
-		Method:  method,
-	}
-
-	if params != nil {
-		raw, err := json.Marshal(params)
-		if err != nil {
-			return err
-		}
-		req.Params = raw
-	}
-
-	return c.send(req)
-}
-
-// Batch sends a JSON-RPC batch composed of the provided calls. Responses are returned
-// in the same order as the supplied calls, with nil entries for notifications.
-func (c *RawClient) Batch(ctx context.Context, calls []BatchCall) ([]*Response, error) {
-	if len(calls) == 0 {
+// Call sends the provided requests and returns their corresponding responses. The
+// payload is encoded as a JSON array even when only a single request is supplied.
+// Responses are aligned with the order of the supplied requests, and notifications
+// (requests without an id) yield nil entries in the returned slice.
+func (c *RawClient) Call(ctx context.Context, requests ...*Request) ([]*Response, error) {
+	if len(requests) == 0 {
 		return nil, nil
 	}
 
@@ -150,9 +70,8 @@ func (c *RawClient) Batch(ctx context.Context, calls []BatchCall) ([]*Response, 
 		ch  chan callResult
 	}
 
-	requests := make([]*Request, 0, len(calls))
-	responses := make([]*Response, len(calls))
-	pendings := make([]pendingEntry, 0, len(calls))
+	responses := make([]*Response, len(requests))
+	pendings := make([]pendingEntry, 0, len(requests))
 
 	cleanup := func() {
 		for _, p := range pendings {
@@ -160,33 +79,35 @@ func (c *RawClient) Batch(ctx context.Context, calls []BatchCall) ([]*Response, 
 		}
 	}
 
-	for i, call := range calls {
-		req := &Request{
-			JSONRPC: Version,
-			Method:  call.Method,
+	for i, req := range requests {
+		if req == nil {
+			cleanup()
+			return nil, fmt.Errorf("jsonrpc2: request at index %d is nil", i)
 		}
-		if call.Params != nil {
-			raw, err := json.Marshal(call.Params)
-			if err != nil {
-				cleanup()
-				return nil, err
-			}
-			req.Params = raw
+		if req.JSONRPC == "" {
+			req.JSONRPC = Version
 		}
-		if !call.Notify {
-			id := atomic.AddUint64(&c.nextID, 1)
-			idStr := strconv.FormatUint(id, 10)
-			req.ID = idStr
-			respCh := make(chan callResult, 1)
-			c.pendMu.Lock()
-			c.pending[idStr] = respCh
+		if req.ID == nil {
+			continue
+		}
+		idKey, ok := normalizeID(req.ID)
+		if !ok {
+			cleanup()
+			return nil, fmt.Errorf("jsonrpc2: invalid request id at index %d", i)
+		}
+		respCh := make(chan callResult, 1)
+		c.pendMu.Lock()
+		if _, exists := c.pending[idKey]; exists {
 			c.pendMu.Unlock()
-			pendings = append(pendings, pendingEntry{id: idStr, idx: i, ch: respCh})
+			cleanup()
+			return nil, fmt.Errorf("jsonrpc2: duplicate request id %s", idKey)
 		}
-		requests = append(requests, req)
+		c.pending[idKey] = respCh
+		c.pendMu.Unlock()
+		pendings = append(pendings, pendingEntry{id: idKey, idx: i, ch: respCh})
 	}
 
-	if err := c.send(requests); err != nil {
+	if err := c.sendRequests(requests); err != nil {
 		cleanup()
 		return nil, err
 	}
@@ -280,10 +201,10 @@ func (c *RawClient) readLoop() {
 	}
 }
 
-func (c *RawClient) send(msg any) error {
+func (c *RawClient) sendRequests(requests []*Request) error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
-	return c.encoder.Encode(msg)
+	return c.encoder.Encode(requests)
 }
 
 func (c *RawClient) dispatchResponse(resp *Response) {
